@@ -1,7 +1,15 @@
+#!/usr/bin/env python3
+
+import os
 import re
+import argparse
+import sys
+from dotenv import load_dotenv
 from gliner import GLiNER
 from unstructured.partition.pdf import partition_pdf
-from unstructured.cleaners.core import clean, group_broken_paragraphs, clean_extra_whitespace
+from unstructured.cleaners.core import (clean, 
+                                        group_broken_paragraphs, 
+                                        clean_extra_whitespace)
 
 from ollama import chat
 from pydantic import BaseModel
@@ -19,18 +27,11 @@ from langchain.text_splitter import CharacterTextSplitter, RecursiveCharacterTex
 class EdgeList():
     """
     Workflow for generating an edge list from a PDF file.
-    file = "TrumpEpstein/PDF/Former Models for Donald Trump’s Agency Say They Violated Immigration Rules and Worked Illegally.pdf"
-    file_name = "TrumpEpstein/edge_lists/" + file.split("/")[-1]
-    elements = partition_pdf(file)
-    sentences = extract_sentences(elements)
-    connections = get_connections(sentences, model, labels)
-    ### edge_list = create_edge_list(connections, file_name=f"{file_name}.csv")
-    ### text = " ".join([s for s in sentences])
     """
 
-    def __init__(self, file: str, ner_threshold: float = 0.55, k: int = 10):
+    def __init__(self, file: str, ner_threshold: float = 0.65, k: int = 10):
         self.file = file
-        self.file_name = None
+        self.file_name = os.path.basename(file)
         self.k = k
         self.ner_threshold = ner_threshold
 
@@ -70,15 +71,16 @@ class EdgeList():
     
     def save_edge_list(self, file_name: str):
         """
-        Save the edge list to a CSV file.
+        Save the edge list to a TSV file.
         """
         with open(file_name, "w") as f:
+            f.write("source\ttarget\n")  # Header row
             for source, target in self.edge_list:
                 f.write(f"{source}\t{target}\n")
         print(f"Edge list saved to {file_name}")
 
     def create_retriever(self):
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=100,chunk_overlap=55) # separators=["\n\n", "\n", ". ", " "]
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=100,chunk_overlap=55)
         embeddings = OllamaEmbeddings(model="mxbai-embed-large")
         vectorstore = InMemoryVectorStore(embeddings)
         docs = []
@@ -86,7 +88,7 @@ class EdgeList():
             docs.append(Document(id=str(i), page_content=s, metadata={"source": self.file_name}))
         all_texts = text_splitter.split_documents(docs)
         vs = vectorstore.from_documents(documents=all_texts, embedding=embeddings)
-        retriever = vs.as_retriever(search_kwargs={"k": self.k, "score_threshold": 0.95}) # 0.3
+        retriever = vs.as_retriever(search_kwargs={"k": self.k, "score_threshold": 0.95})
         return retriever
     
     def create_rag_chain(self):
@@ -152,14 +154,12 @@ class EdgeList():
         """
         Identify a person's full name using the RAG pipeline with structured output.
         """
-        # Pass both name and entity_type as separate inputs
         query = {
-            "input":  name, # "input": f"Please identify the full name of {name} if it is a person.",
+            "input":  name,
             "entity_type": entity_type
         }
         response = self.rag_chain.invoke(query)
         answer = response['answer'].strip()
-        # Post-process the answer for consistency
         return self._format_name_response(name, entity_type, answer)
     
     def _format_name_response(self, input_name: str, entity_type: str, response: str) -> str:
@@ -167,9 +167,7 @@ class EdgeList():
         Format the response to ensure consistent output format.
         """
         response_lower = response.lower()
-        # Check for explicit indicators
         if any(indicator in response_lower for indicator in ['pseudonym', 'fake name', 'alias', 'not real']):
-            # Extract the name part before adding (pseudonym)
             clean_name = response.split('(')[0].strip() if '(' in response else input_name
             return [clean_name, "(pseudonym)"]
         
@@ -180,11 +178,9 @@ class EdgeList():
             return [input_name, "(unknown)"]
 
         elif len(response.split()) >= 2 and not any(word in response_lower for word in ['unknown', 'pseudonym']) or any(word in response_lower for word in ['real', 'real name']):
-            # Looks like a full name
             pattern = r'\s*\(real(?:\s+name)?\)'
             cleaned = re.sub(pattern, '', response.strip())
-            cleaned = cleaned.strip("'\"")  # Remove any leading/trailing quotes
-            # return cleaned
+            cleaned = cleaned.strip("'\"")
             return [cleaned, "(real name)"]
 
         else:
@@ -194,14 +190,11 @@ class EdgeList():
         """ 
         Check if a name is a person using the RAG pipeline. 
         """
-        # Define a Pydantic model for structured output
         class Person(BaseModel):
             name: str
 
-        # Retrieve context for the name
         context = " ".join([r.page_content.strip(".").strip() for r in self.retriever.batch([name])[0]])
 
-        # Query the LLM for the person's full name
         response = chat(
         messages=[
             {
@@ -221,6 +214,30 @@ class EdgeList():
         person = Person.model_validate_json(response.message.content)
         return person
     
+    def _judge_name(self, name1, name2):
+        """ 
+        Check if a name is a person using the RAG pipeline. 
+        """
+        class Judgement(BaseModel):
+            best: str
+
+        response = chat(
+        messages=[
+            {
+            'role': 'user',
+            'content': f"""
+                        You are given two names: {name1} and {name2}. 
+                        You're goal is to judge the best representation of a person or organization's name.
+                        Prefer full names over single names.
+                        Only judge between the two names. Only return the best name.
+                        """,
+            }
+        ],
+        model='phi4', format=Judgement.model_json_schema(),
+        )
+        judgement = Judgement.model_validate_json(response.message.content)
+        return judgement
+
     def create_edge_list(self):
         """
         Create an edge list from the connections.
@@ -240,30 +257,14 @@ class EdgeList():
     def _final_name_check(self, entity):
         """
         Given an entity tuple (name, entity_type), returns the best full name match.
-        Uses both el._identify_person and el._check_name for comparison.
-        
-        Args:
-            entity: tuple of (name, entity_type) e.g., ('Kate', 'Person')
-        
-        Returns:
-            tuple: (best_name, entity_type)
-        
-        Examples:
-            ('Gehi', 'Person') -> ('Naresh Gehi', 'Person')
-            ('Palmer', 'Person') -> ('Alexia Palmer', 'Person') 
-            ('Anna', 'Person') -> ('Anna', 'Person') # if no full name found
-            ('Vogue', 'Organization') -> ('Vogue', 'Organization')
         """
         name, entity_type = entity
         
-        # For non-Person entities, return as-is
         if entity_type in ['Organization', 'Company']:
             return (name, entity_type)
         
-        # For Person entities, try to get full names from both methods
         try:
-            res1 = el._identify_person(name, entity_type)
-            # Handle case where res1 might be a list or string
+            res1 = self._identify_person(name, entity_type)
             if isinstance(res1, list) and len(res1) > 0:
                 name1 = res1[0]
             else:
@@ -273,19 +274,16 @@ class EdgeList():
             name1 = name
         
         try:
-            res2 = el._check_name(name, entity_type)
+            res2 = self._check_name(name, entity_type)
             name2 = res2.name if hasattr(res2, 'name') else str(res2)
         except Exception as e:
             print(f"Error in _check_name: {e}")
             name2 = name
         
-        # Helper functions
         def is_full_name(candidate_name):
-            """Check if a string appears to be a full name (at least 2 words, no status indicators)"""
             if not isinstance(candidate_name, str):
                 return False
             
-            # Remove common status indicators
             clean_name = candidate_name.lower()
             status_indicators = ['(unknown)', '(pseudonym)', '(unclear)', '(person)', '(real name)']
             
@@ -293,43 +291,120 @@ class EdgeList():
                 if indicator in clean_name:
                     return False
             
-            # Check if it has at least 2 words
             words = candidate_name.strip().split()
             return len(words) >= 2
         
         def clean_name(candidate_name):
-            """Remove quotes and extra whitespace"""
             if not isinstance(candidate_name, str):
                 return str(candidate_name)
             candidate_name = candidate_name.strip("'\"").strip()
             candidate_name = candidate_name.split('(')[0].strip()
             return candidate_name
         
-        # Clean the names
         name1_clean = clean_name(name1)
         name2_clean = clean_name(name2)
         
-        # Decision logic
         name1_is_full = is_full_name(name1_clean)
         name2_is_full = is_full_name(name2_clean)
         
-        # If both results are the same, return that
         if name1_clean.lower() == name2_clean.lower():
             return (name1_clean, entity_type)
         
-        # If both are full names, prefer the longer one (more specific)
         if name1_is_full and name2_is_full:
-            if len(name1_clean.split()) >= len(name2_clean.split()):
-                return (name1_clean, entity_type)
-            else:
-                return (name2_clean, entity_type)
+            res = self._judge_name(name1_clean, name2_clean)
+            return (res.best, entity_type)
         
-        # If only one result is a full name, prefer it
         if name1_is_full and not name2_is_full:
-            return (name1_clean, entity_type)
+            res = self._judge_name(name1_clean, name2_clean)
+            return (res.best, entity_type)
         elif name2_is_full and not name1_is_full:
-            return (name2_clean, entity_type)
+            res = self._judge_name(name1_clean, name2_clean)
+            return (res.best, entity_type)
         
-        # If neither is a full name, return the original name
-        # (this handles cases like pseudonyms or when no full name is found)
         return (name, entity_type)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Generate edge list from PDF file using Named Entity Recognition",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s document.pdf
+  %(prog)s document.pdf -o edges.tsv
+  %(prog)s document.pdf --ner-threshold 0.7 --top-k 15
+        """
+    )
+
+    parser.add_argument('-i', '--input', dest='input_pdf', help='Input PDF file path', required=True)
+    parser.add_argument('-o', '--output', help='Output TSV file path (default: <input_filename>_edges.tsv)', default=None, required=True)
+    parser.add_argument('-n', '--ner-threshold', type=float, default=0.65, help='NER confidence threshold (default: 0.65)')
+    parser.add_argument('-k', '--top-k', type=int, default=10, help='Top K parameter for retrieval (default: 10)')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose output')
+
+    args = parser.parse_args()
+    
+    # Validate input file
+    if not os.path.exists(args.input_pdf):
+        print(f"Error: Input file '{args.input_pdf}' does not exist.", file=sys.stderr)
+        sys.exit(1)
+    
+    if not args.input_pdf.lower().endswith('.pdf'):
+        print(f"Error: Input file must be a PDF file.", file=sys.stderr)
+        sys.exit(1)
+    
+    # Generate output filename if not provided
+    if args.output is None:
+        base_name = os.path.splitext(os.path.basename(args.input_pdf))[0]
+        args.output = f"{base_name}_edges.tsv"
+    
+    # Ensure output directory exists
+    output_dir = os.path.dirname(args.output)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    if args.verbose:
+        print(f"Processing PDF: {args.input_pdf}")
+        print(f"Output file: {args.output}")
+        print(f"NER threshold: {args.ner_threshold}")
+        print(f"Top K: {args.top_k}")
+        print("-" * 50)
+    
+    try:
+        # Load environment variables
+        load_dotenv()
+        
+        # Create EdgeList instance and process
+        if args.verbose:
+            print("Initializing EdgeList processor...")
+        
+        el = EdgeList(
+            file=args.input_pdf,
+            ner_threshold=args.ner_threshold,
+            k=args.top_k
+        )
+        
+        if args.verbose:
+            print("Processing PDF and extracting entities...")
+        
+        edge_list = el.fit_transform()
+        
+        if args.verbose:
+            print(f"Generated {len(edge_list)} edges")
+        
+        # Save the edge list
+        el.save_edge_list(args.output)
+        
+        if args.verbose:
+            print("Processing completed successfully!")
+            
+    except Exception as e:
+        print(f"Error processing file: {e}", file=sys.stderr)
+        if args.verbose:
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
